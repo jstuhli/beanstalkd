@@ -1,0 +1,223 @@
+From 89e186c24444b43182e2dab0869c83e21baba0ad Mon Sep 17 00:00:00 2001
+From: "Stuart R. Anderson" <anderson@netsweng.com>
+Date: Sat, 27 Apr 2013 14:18:47 -0400
+Subject: [PATCH] Add 'put-unique' command.
+
+This command can be used to solve many of the de-duplication issues
+by not allowing duplicate messages in the queue to begin with. It has
+no impact on the performance on the regular put command as it is
+implmented as a parrallel command. Instead of using the job number
+or name to try and find wither a message exists already, this command
+compares the entire message body to determine uniqueness.
+
+This code is in production using a 1.4.6 version of beanstalkd. This
+is a quick forward port, which has not been thoroughly tested, but the
+porting was straightforward, so there probably won't be any suprises.
+---
+ dat.h  |  5 ++++-
+ job.c  | 32 ++++++++++++++++++++++++++++++++
+ prot.c | 57 +++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 91 insertions(+), 3 deletions(-)
+
+diff --git a/dat.h b/dat.h
+index 2570e76..82befdc 100644
+--- a/dat.h
++++ b/dat.h
+@@ -138,7 +138,8 @@ struct job {
+     Jobrec r; // persistent fields; these get written to the wal
+ 
+     /* bookeeping fields; these are in-memory only */
+-    char pad[6];
++    char pad[5];
++    char unique;
+     tube tube;
+     job prev, next; /* linked list of jobs */
+     job ht_next; /* Next job in a hash table list */
+@@ -203,11 +204,13 @@ void job_free(job j);
+ 
+ /* Lookup a job by job ID */
+ job job_find(uint64 job_id);
++job job_find_by_body(job j);
+ 
+ /* the void* parameters are really job pointers */
+ void job_setheappos(void*, int);
+ int job_pri_less(void*, void*);
+ int job_delay_less(void*, void*);
++int job_body_cmp(job a, job b);
+ 
+ job job_copy(job j);
+ 
+diff --git a/job.c b/job.c
+index f716fee..a65babf 100644
+--- a/job.c
++++ b/job.c
+@@ -84,6 +84,27 @@ job_find(uint64 job_id)
+ }
+ 
+ job
++job_find_by_body(job j)
++{
++    job jh = NULL;
++    int index;
++
++    for (index = 0, jh = all_jobs[index];
++        index < all_jobs_cap-1;
++        index++, jh = all_jobs[index]) {
++	    do {
++        	if( jh &&
++                    (jh->r.state != Invalid) &&
++                    (job_body_cmp(j,jh) == 0) ) {
++			return jh;
++                        }
++                } while( jh && ((jh=jh->ht_next) != NULL) );
++    }
++
++    return jh;
++}
++
++job
+ allocate_job(int body_size)
+ {
+     job j;
+@@ -172,6 +193,17 @@ job_delay_less(void *ax, void *bx)
+     return a->r.id < b->r.id;
+ }
+ 
++int
++job_body_cmp(job a, job b)
++{
++    int bsize = min(a->r.body_size, b->r.body_size);
++
++    if (a->r.body_size > b->r.body_size) return 1;
++    if (a->r.body_size < b->r.body_size) return -1;
++    if (a->tube != b->tube) return -1;
++    return memcmp(a->body, b->body, bsize);
++}
++
+ job
+ job_copy(job j)
+ {
+diff --git a/prot.c b/prot.c
+index 1a725e3..f178fce 100644
+--- a/prot.c
++++ b/prot.c
+@@ -24,6 +24,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+     "0123456789-+/;.$_()"
+ 
+ #define CMD_PUT "put "
++#define CMD_PUT_UNIQUE "put-unique "
+ #define CMD_PEEKJOB "peek "
+ #define CMD_PEEK_READY "peek-ready"
+ #define CMD_PEEK_DELAYED "peek-delayed"
+@@ -136,7 +137,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+ #define OP_QUIT 22
+ #define OP_PAUSE_TUBE 23
+ #define OP_JOBKICK 24
+-#define TOTAL_OPS 25
++#define OP_PUT_UNIQUE 25
++#define TOTAL_OPS 26
+ 
+ #define STATS_FMT "---\n" \
+     "current-jobs-urgent: %u\n" \
+@@ -145,6 +147,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+     "current-jobs-delayed: %u\n" \
+     "current-jobs-buried: %u\n" \
+     "cmd-put: %" PRIu64 "\n" \
++    "cmd-put-unique: %" PRIu64 "\n" \
+     "cmd-peek: %" PRIu64 "\n" \
+     "cmd-peek-ready: %" PRIu64 "\n" \
+     "cmd-peek-delayed: %" PRIu64 "\n" \
+@@ -273,6 +276,7 @@ static const char * op_names[] = {
+     CMD_QUIT,
+     CMD_PAUSE_TUBE,
+     CMD_JOBKICK,
++    CMD_PUT_UNIQUE,
+ };
+ 
+ static job remove_buried_job(job j);
+@@ -739,6 +743,7 @@ static int
+ which_cmd(Conn *c)
+ {
+ #define TEST_CMD(s,c,o) if (strncmp((s), (c), CONSTSTRLEN(c)) == 0) return (o);
++    TEST_CMD(c->cmd, CMD_PUT_UNIQUE, OP_PUT_UNIQUE);
+     TEST_CMD(c->cmd, CMD_PUT, OP_PUT);
+     TEST_CMD(c->cmd, CMD_PEEKJOB, OP_PEEKJOB);
+     TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY);
+@@ -822,7 +827,7 @@ static void
+ enqueue_incoming_job(Conn *c)
+ {
+     int r;
+-    job j = c->in_job;
++    job j = c->in_job, j2=NULL;
+ 
+     c->in_job = NULL; /* the connection no longer owns this job */
+     c->in_job_read = 0;
+@@ -842,6 +847,11 @@ enqueue_incoming_job(Conn *c)
+         return reply_serr(c, MSG_DRAINING);
+     }
+ 
++    if ( j->unique && (j2=job_find_by_body(j)) != NULL ) {
++        job_free(j);
++        return reply_line(c, STATE_SENDWORD, MSG_INSERTED_FMT, j2->r.id);
++    }
++
+     if (j->walresv) return reply_serr(c, MSG_INTERNAL_ERROR);
+     j->walresv = walresvput(&c->srv->wal, j);
+     if (!j->walresv) return reply_serr(c, MSG_OUT_OF_MEMORY);
+@@ -891,6 +901,7 @@ fmt_stats(char *buf, size_t size, void *x)
+             get_delayed_job_ct(),
+             global_stat.buried_ct,
+             op_ct[OP_PUT],
++            op_ct[OP_PUT_UNIQUE],
+             op_ct[OP_PEEKJOB],
+             op_ct[OP_PEEK_READY],
+             op_ct[OP_PEEK_DELAYED],
+@@ -1253,6 +1264,48 @@ dispatch_cmd(Conn *c)
+         maybe_enqueue_incoming_job(c);
+ 
+         break;
++    case OP_PUT_UNIQUE:
++        r = read_pri(&pri, c->cmd + 10, &delay_buf);
++        if (r) return reply_msg(c, MSG_BAD_FORMAT);
++
++        r = read_delay(&delay, delay_buf, &ttr_buf);
++        if (r) return reply_msg(c, MSG_BAD_FORMAT);
++
++        r = read_ttr(&ttr, ttr_buf, &size_buf);
++        if (r) return reply_msg(c, MSG_BAD_FORMAT);
++
++        errno = 0;
++        body_size = strtoul(size_buf, &end_buf, 10);
++        if (errno) return reply_msg(c, MSG_BAD_FORMAT);
++
++        op_ct[type]++;
++
++        if (body_size > job_data_size_limit) {
++            /* throw away the job body and respond with JOB_TOO_BIG */
++            return skip(c, body_size + 2, MSG_JOB_TOO_BIG);
++        }
++
++        /* don't allow trailing garbage */
++        if (end_buf[0] != '\0') return reply_msg(c, MSG_BAD_FORMAT);
++
++        connsetproducer(c);
++
++        c->in_job = make_job(pri, delay, ttr ? : 1, body_size + 2, c->use);
++        c->in_job->unique = 1;
++
++        /* OOM? */
++        if (!c->in_job) {
++            /* throw away the job body and respond with OUT_OF_MEMORY */
++            twarnx("server error: " MSG_OUT_OF_MEMORY);
++            return skip(c, body_size + 2, MSG_OUT_OF_MEMORY);
++        }
++
++        fill_extra_data(c);
++
++        /* it's possible we already have a complete job */
++        maybe_enqueue_incoming_job(c);
++
++        break;
+     case OP_PEEK_READY:
+         /* don't allow trailing garbage */
+         if (c->cmd_len != CMD_PEEK_READY_LEN + 2) {
